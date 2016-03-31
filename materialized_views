@@ -1,0 +1,230 @@
+\timing on
+
+
+CREATE TABLE data (
+  id bigserial primary key,
+  github_id bigint not null,
+  type text not null,
+  public bool not null,
+  created_at timestamp not null,
+  actor jsonb,
+  repo jsonb,
+  org jsonb,
+  payload jsonb
+);
+
+
+SELECT type, count(*) AS value FROM data GROUP BY type ORDER BY 2 DESC LIMIT 5;
+
+
+SELECT repo ->> 'name' AS repo FROM data LIMIT 1;
+
+SELECT payload -> 'issue' AS issue FROM data WHERE type = 'IssuesEvent' LIMIT 1;
+
+CREATE MATERIALIZED VIEW data_daily_counts_view AS SELECT created_at::date AS created_date, count(*) FROM data GROUP BY created_date;
+
+SELECT * FROM data_daily_counts_view WHERE created_date between '2015-01-01' AND '2015-01-031' ORDER by created_date ASC;
+
+CREATE UNIQUE INDEX ON data_daily_counts_view(created_date);
+
+REFRESH MATERIALIZED VIEW CONCURRENTLY data_daily_counts_view;
+
+SELECT actor -> 'login' , payload->'description' FROM data where type = 'CreateEvent' LIMIT 10; 
+
+SELECT actor -> 'login' , payload -> 'description' FROM data where type = 'CreateEvent' AND actor @> '{ "login":"alexanderdean" }' LIMIT 10;
+
+
+
+CREATE TABLE data_daily_counts_cached (created_date date PRIMARY KEY, value int);
+
+INSERT INTO data_daily_counts_cached SELECT created_at::date AS created_date, count(*) FROM data GROUP BY created_date;
+
+CREATE OR REPLACE FUNCTION update_daily_aggregates()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $body$
+BEGIN
+    LOOP
+        UPDATE data_daily_counts_cached SET value = value+1 WHERE created_date = NEW.created_at::date;
+        IF found THEN
+            RETURN NULL;
+        END IF;
+        BEGIN
+            INSERT INTO data_daily_counts_cached VALUES (NEW.created_at::date, 1);
+            RETURN NULL;    
+        EXCEPTION WHEN unique_violation THEN
+            -- retry
+        END;
+    END LOOP;
+END;
+$body$;
+
+
+DROP TRIGGER IF EXISTS data_change ON data;
+
+CREATE TRIGGER data_change
+AFTER INSERT ON data
+FOR EACH ROW
+EXECUTE PROCEDURE update_daily_aggregates();
+
+
+
+
+CREATE TABLE data_daily_counts_queue (
+    created_date date,
+    diff int
+);
+
+CREATE INDEX ON data_daily_counts_queue(created_date);
+
+
+CREATE OR REPLACE FUNCTION append_to_daily_counts_queue()
+RETURNS TRIGGER LANGUAGE plpgsql
+AS $body$
+BEGIN
+    CASE TG_OP
+    WHEN 'INSERT' THEN
+        INSERT INTO data_daily_counts_queue(created_date, diff)
+        VALUES (date_trunc('day', NEW.created_at), +1);
+
+    WHEN 'UPDATE' THEN
+        INSERT INTO data_daily_counts_queue(created_date, diff)
+        VALUES (date_trunc('day', NEW.created_at), +1);
+
+        INSERT INTO data_daily_counts_queue(created_date, diff)
+        VALUES (date_trunc('day', OLD.created_at), -1);
+
+    WHEN 'DELETE' THEN
+
+        INSERT INTO data_daily_counts_queue(created_date, diff)
+        VALUES (date_trunc('day', OLD.created_at), -1);
+
+    END CASE;
+
+    IF random() < 0.0001 THEN  /* 1/10,000 probability */
+       PERFORM flush_daily_counts_queue();
+    END IF;
+
+    RETURN NULL;
+END;
+$body$;
+
+DROP TRIGGER IF EXISTS data_change ON data;
+CREATE TRIGGER data_change after 
+INSERT OR UPDATE OR DELETE 
+ON data FOR each row
+EXECUTE PROCEDURE append_to_daily_counts_queue();
+
+
+CREATE OR REPLACE FUNCTION flush_daily_counts_queue()
+RETURNS bool
+LANGUAGE plpgsql
+AS $body$
+DECLARE
+    v_inserts int;
+    v_updates int;
+    v_prunes int;
+BEGIN
+    IF NOT pg_try_advisory_xact_lock('data_daily_counts_queue'::regclass::oid::bigint) THEN
+         RAISE NOTICE 'skipping queue flush';
+         RETURN false;
+    END IF;
+
+    WITH
+    aggregated_queue AS (
+        SELECT created_date, SUM(diff) AS value
+        FROM data_daily_counts_queue
+        GROUP BY created_date
+    ),
+    preexist AS (
+        SELECT *,
+            EXISTS(
+                SELECT *
+                FROM data_daily_counts_cached h
+                WHERE h.created_date = aggregated_queue.created_date
+            ) does_exist
+        FROM aggregated_queue
+    ),
+    perform_updates AS (
+        UPDATE data_daily_counts_cached AS h
+        SET value = h.value + preexist.value
+        FROM preexist
+        WHERE preexist.does_exist AND h.created_date = preexist.created_date
+        RETURNING 1
+    ),
+    perform_inserts AS (
+        INSERT INTO data_daily_counts_cached
+        SELECT created_date, value
+        FROM preexist
+        WHERE NOT preexist.does_exist
+        RETURNING 1
+    ),
+    perform_prune AS (
+        DELETE FROM data_daily_counts_queue
+        RETURNING 1
+    )
+    SELECT
+        (SELECT count(*) FROM perform_updates) updates,
+        (SELECT count(*) FROM perform_inserts) inserts,
+        (SELECT count(*) FROM perform_prune) prunes
+    INTO v_updates, v_inserts, v_prunes;
+
+    RAISE NOTICE 'performed queue (hourly) flush: % inserts, % updates, % prunes', v_inserts, v_updates, v_prunes;
+
+    RETURN true;
+END;
+$body$;
+
+
+DROP TRIGGER data_change ON data;
+
+CREATE TRIGGER data_change after INSERT OR UPDATE OR DELETE ON data FOR each row EXECUTE PROCEDURE append_to_daily_counts_queue();
+
+
+
+
+
+CREATE OR REPLACE VIEW data_daily_counts AS
+SELECT created_date, SUM(value) AS value
+FROM (
+    SELECT created_date, value
+    FROM data_daily_counts_cached
+  UNION ALL
+    SELECT created_date, diff AS value
+    FROM data_daily_counts_queue
+) combine
+GROUP BY created_date;
+
+
+
+
+SELECT pagg.create_cascaded_rollup(
+    tablename := 'data',
+    rollupname := 'data_by_type',
+    group_by := ARRAY['type'],
+    cascade := ARRAY[$$date_trunc('hour', created_at)$$, $$date_trunc('day', created_at)$$, $$date_trunc('month', created_at)$$],
+    cascade_names := ARRAY['hourly', 'daily', 'monthly'],
+    cascade_name := 'created_at',
+    agg_count := ARRAY['*'],
+    agg_count_names := ARRAY['countstar']
+);
+
+
+
+SELECT pagg.create_cascaded_rollup(
+    tablename := 'data',
+    rollupname := 'data_by_type_repo',
+    group_by := ARRAY['type', $$repo->>'name'$$],
+    group_by_names := ARRAY['type', 'reponame'],
+    cascade := ARRAY[$$date_trunc('hour', created_at)$$, $$date_trunc('day', created_at)$$, $$date_trunc('month', created_at)$$],
+    cascade_names := ARRAY['hourly', 'daily', 'monthly'],
+    cascade_name := 'created_at',
+    agg_sum := ARRAY[$$(payload->>'distinct_size')::int8$$],
+    agg_sum_names := ARRAY['num_commits']
+);
+
+
+
+SELECT created_at, to_char(created_at, 'Day'), num_commits FROM pagg.data_by_type_repo_daily WHERE reponame = 'postgres/postgres' AND TYPE = 'PushEvent' ORDER BY created_at;
+
+SELECT created_at, to_char(created_at, 'Day'), sum(countstar) FROM pagg.data_by_type_daily WHERE TYPE = 'PushEvent' GROUP BY 1, 2 ORDER BY 3 DESC;
